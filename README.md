@@ -112,16 +112,22 @@
    cd TripCaddie-ClaudeCode
    ```
 
-2. **Configure environment**
+2. **Configure admin credentials**
    ```bash
    cp .env.example .env
-   # Edit .env with your settings
+   # Edit .env with your admin email/password
    ```
 
-3. **Build and run with Docker**
+3. **Deploy**
    ```bash
-   docker compose up -d --build
+   ./deploy.sh
    ```
+
+   This single command:
+   - Auto-generates cryptographic secrets (`.secrets` file)
+   - Creates default `.env` if missing
+   - Builds Docker images
+   - Starts all containers
 
 4. **Access the application**
 
@@ -132,34 +138,45 @@
    | Dashboard | http://localhost:47319/admin/dashboard |
    | Health Check | http://localhost:47319/api/health |
 
-### Stopping the Application
+### Deployment Commands
 
 ```bash
-docker compose down
-```
-
-### Resetting the Database
-
-```bash
-docker compose down -v
-docker compose up -d
+./deploy.sh          # Build and start (default)
+./deploy.sh down     # Stop containers
+./deploy.sh restart  # Restart containers
+./deploy.sh reset    # Delete all data and regenerate secrets
+./deploy.sh logs     # View app logs
+./deploy.sh logs db  # View specific service logs
 ```
 
 ## Configuration
 
 ### Environment Variables
 
+The deployment uses two files:
+- `.env` - User-specific settings you configure
+- `.secrets` - Auto-generated cryptographic secrets
+
+#### User Configuration (.env)
+
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `DATABASE_URL` | PostgreSQL connection string | Yes |
-| `REDIS_URL` | Redis connection string | Yes |
-| `NEXTAUTH_URL` | Application URL | Yes |
-| `NEXTAUTH_SECRET` | Session encryption key | Yes |
-| `ENCRYPTION_KEY` | 32-byte AES key for PII | Yes |
-| `ADMIN_EMAIL` | Default admin email | Yes |
-| `ADMIN_PASSWORD` | Default admin password | Yes |
-| `RESEND_API_KEY` | Email service API key | No |
+| `ADMIN_EMAIL` | Admin login email | Yes |
+| `ADMIN_NAME` | Admin display name | Yes |
+| `ADMIN_PASSWORD` | Admin login password | Yes |
+| `NEXTAUTH_URL` | Application URL | No (default: localhost:47319) |
+| `RESEND_API_KEY` | Email service API key | No (emails disabled if empty) |
 | `EMAIL_FROM` | Sender email address | No |
+
+#### Auto-Generated Secrets (.secrets)
+
+These are created automatically on first `./deploy.sh`:
+
+| Variable | Description |
+|----------|-------------|
+| `DB_PASSWORD` | PostgreSQL password (32 chars) |
+| `NEXTAUTH_SECRET` | Session encryption key (base64) |
+| `ENCRYPTION_KEY` | AES-256 key for PII (base64) |
 
 ### Supported Destinations
 

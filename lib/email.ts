@@ -1,6 +1,17 @@
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Lazy-load Resend client to avoid initialization errors when API key is not set
+let resend: Resend | null = null;
+
+function getResendClient(): Resend | null {
+  if (!process.env.RESEND_API_KEY) {
+    return null;
+  }
+  if (!resend) {
+    resend = new Resend(process.env.RESEND_API_KEY);
+  }
+  return resend;
+}
 
 interface EmailOptions {
   to: string | string[];
@@ -27,10 +38,17 @@ interface BookingEmailData {
 }
 
 export async function sendEmail(options: EmailOptions) {
+  const client = getResendClient();
+
+  if (!client) {
+    console.warn("Email sending disabled: RESEND_API_KEY not configured");
+    return { success: true, messageId: "email-disabled", skipped: true };
+  }
+
   const from = process.env.EMAIL_FROM || "noreply@tripcaddie.com";
 
   try {
-    const result = await resend.emails.send({
+    const result = await client.emails.send({
       from,
       to: Array.isArray(options.to) ? options.to : [options.to],
       subject: options.subject,

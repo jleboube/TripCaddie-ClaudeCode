@@ -31,6 +31,9 @@ yarn-error.log*
 .env.*.local
 !.env.example
 
+# Auto-generated secrets
+.secrets
+
 # Vercel
 .vercel
 

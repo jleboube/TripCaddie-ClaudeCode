@@ -83,14 +83,18 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/lib ./lib
 COPY --from=builder /app/types ./types
 COPY --from=builder /app/workers ./workers
+COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 
 # Install tsx for running TypeScript
 RUN npm install -g tsx
+
+# Make entrypoint executable
+RUN chmod +x ./scripts/worker-entrypoint.sh
 
 # Set ownership
 RUN chown -R worker:nodejs /app
 
 USER worker
 
-CMD ["tsx", "workers/agent-worker.ts"]
+ENTRYPOINT ["./scripts/worker-entrypoint.sh"]

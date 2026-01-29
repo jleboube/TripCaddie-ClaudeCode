@@ -2,7 +2,7 @@
 set -e
 
 echo "============================================"
-echo "  Starting TripCaddie IQBE"
+echo "  Starting TripCaddie Worker"
 echo "============================================"
 
 # Build DATABASE_URL from components if not already set
@@ -11,13 +11,5 @@ if [ -z "$DATABASE_URL" ]; then
 fi
 
 echo ""
-echo "Synchronizing database schema..."
-npx prisma@6 db push
-
-echo ""
-echo "Running database seed..."
-tsx prisma/seed.ts || echo "Seed completed or skipped"
-
-echo ""
-echo "Starting application..."
-exec node server.js
+echo "Starting agent worker..."
+exec tsx workers/agent-worker.ts

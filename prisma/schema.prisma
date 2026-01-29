@@ -1,0 +1,429 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum InquiryStatus {
+  PENDING
+  REQUEST_ACCEPTED
+  SEARCH_IN_PROGRESS
+  SEARCH_COMPLETED
+  BOOKING_IN_PROGRESS
+  BOOKING_REQUEST_SENT
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum AgentType {
+  REQUEST
+  SEARCH
+  BOOKING
+}
+
+enum AgentExecutionStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  RETRYING
+}
+
+enum BookingDeliveryStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+  BOUNCED
+}
+
+enum UserRole {
+  ADMIN
+  OPERATOR
+  VIEWER
+}
+
+// ============================================
+// AUTHENTICATION (NextAuth.js)
+// ============================================
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  password      String?
+  role          UserRole  @default(ADMIN)
+  accounts      Account[]
+  sessions      Session[]
+  auditLogs     AuditLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@id([identifier, token])
+}
+
+// ============================================
+// CORE BUSINESS ENTITIES
+// ============================================
+
+model Inquiry {
+  id            String        @id @default(cuid())
+  inquiryNumber String        @unique
+  status        InquiryStatus @default(PENDING)
+
+  // Contact Information (stored encrypted)
+  contactName  String
+  contactEmail String
+  contactPhone String
+
+  // Trip Requirements
+  destination     String
+  arrivalDate     DateTime
+  departureDate   DateTime
+  numberOfNights  Int
+  numberOfGolfers Int
+  roundsPerGolfer Int
+  numberOfRooms   Int
+  roomType        String   @default("double")
+
+  // Preferences
+  preferredResorts String[]
+  budgetMin        Decimal? @db.Decimal(10, 2)
+  budgetMax        Decimal? @db.Decimal(10, 2)
+  specialRequests  String?  @db.Text
+
+  // Normalized/Validated Data
+  normalizedData   Json?
+  validationErrors Json?
+
+  // Relationships
+  searchResults   SearchResult[]
+  bookingRequests BookingRequest[]
+  agentExecutions AgentExecution[]
+
+  // Metadata
+  source    String  @default("web")
+  ipAddress String?
+  userAgent String?
+
+  // Timestamps
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([contactEmail])
+}
+
+model Resort {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String? @db.Text
+
+  // Location
+  address   String?
+  city      String
+  state     String
+  country   String   @default("USA")
+  latitude  Decimal? @db.Decimal(10, 8)
+  longitude Decimal? @db.Decimal(11, 8)
+
+  // Destination-specific content (from Original Prompt)
+  highlights      String[] // Key selling points, e.g., "Pinehurst No. 2", "Historic village feel"
+  weatherInfo     Json?    // Monthly averages: { "jan": { "high": 52, "low": 32, "conditions": "Cool and dry" }, ... }
+  websiteUrl      String?
+  sampleItinerary Json?    // Sample day-by-day itinerary template
+
+  // Capacity
+  maxGolfers      Int
+  maxRooms        Int
+  numberOfCourses Int @default(1)
+
+  // Availability
+  availabilityWindows AvailabilityWindow[]
+  blackoutDates       BlackoutDate[]
+
+  // Pricing
+  pricingRules       PricingRule[]
+  basePricePerGolfer Decimal? @db.Decimal(10, 2)
+  basePricePerRoom   Decimal? @db.Decimal(10, 2)
+
+  // Contact Routing
+  primaryEmail    String
+  secondaryEmails String[]
+  notificationPrefs Json?
+
+  // Configuration
+  minimumNights      Int @default(1)
+  minimumGolfers     Int @default(4)
+  advanceBookingDays Int @default(7)
+
+  // Status
+  isActive Boolean @default(true)
+
+  // Relationships
+  searchResults   SearchResult[]
+  bookingRequests BookingRequest[]
+
+  // Metadata
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+  @@index([city, state])
+}
+
+model AvailabilityWindow {
+  id       String @id @default(cuid())
+  resortId String
+  resort   Resort @relation(fields: [resortId], references: [id], onDelete: Cascade)
+
+  startDate DateTime
+  endDate   DateTime
+
+  // Capacity overrides for this window
+  availableRooms    Int?
+  availableTeeTimes Int?
+
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([resortId, startDate, endDate])
+}
+
+model BlackoutDate {
+  id       String @id @default(cuid())
+  resortId String
+  resort   Resort @relation(fields: [resortId], references: [id], onDelete: Cascade)
+
+  date   DateTime @db.Date
+  reason String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([resortId, date])
+  @@index([resortId])
+}
+
+model PricingRule {
+  id       String @id @default(cuid())
+  resortId String
+  resort   Resort @relation(fields: [resortId], references: [id], onDelete: Cascade)
+
+  name      String
+  startDate DateTime?
+  endDate   DateTime?
+
+  // Pricing adjustments
+  pricePerGolfer   Decimal? @db.Decimal(10, 2)
+  pricePerRoom     Decimal? @db.Decimal(10, 2)
+  percentageAdjust Decimal? @db.Decimal(5, 2)
+
+  // Conditions
+  minimumNights  Int?
+  minimumGolfers Int?
+  daysOfWeek     Int[]
+
+  priority Int     @default(0)
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([resortId, isActive])
+}
+
+model SearchResult {
+  id        String  @id @default(cuid())
+  inquiryId String
+  inquiry   Inquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+  resortId  String
+  resort    Resort  @relation(fields: [resortId], references: [id])
+
+  // Match scoring
+  matchScore        Decimal @db.Decimal(5, 2)
+  availabilityMatch Boolean
+  capacityMatch     Boolean
+  priceMatch        Boolean?
+
+  // Pricing estimate - RANGES per Original Prompt requirements
+  estimatedTotal    Decimal? @db.Decimal(10, 2) // Base estimate
+  estimatedMin      Decimal? @db.Decimal(10, 2) // Low end of range
+  estimatedMax      Decimal? @db.Decimal(10, 2) // High end of range
+  perPersonMin      Decimal? @db.Decimal(10, 2) // Per-person low
+  perPersonMax      Decimal? @db.Decimal(10, 2) // Per-person high
+  priceBreakdown    Json?
+  pricingAssumptions String[] // e.g., ["Double occupancy", "Peak-season rates", "Standard resort fees"]
+
+  // Availability details
+  availableRooms    Int?
+  availableTeeTimes Int?
+
+  // Weather for travel dates
+  weatherOverview   Json?    // { "avgHigh": 75, "avgLow": 55, "conditions": "Mild and sunny" }
+
+  // Sample itinerary for this inquiry/resort combo
+  sampleItinerary   Json?
+
+  notes String? @db.Text
+
+  // Selection
+  isSelected Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@unique([inquiryId, resortId])
+  @@index([inquiryId])
+  @@index([matchScore])
+}
+
+model BookingRequest {
+  id        String  @id @default(cuid())
+  inquiryId String
+  inquiry   Inquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+  resortId  String
+  resort    Resort  @relation(fields: [resortId], references: [id])
+
+  // Compiled booking data
+  bookingData Json
+
+  // Delivery tracking
+  sentToEmails   String[]
+  deliveryStatus BookingDeliveryStatus @default(PENDING)
+  sentAt         DateTime?
+  deliveredAt    DateTime?
+  failureReason  String?
+
+  // Tracking
+  emailMessageId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([inquiryId])
+  @@index([deliveryStatus])
+}
+
+// ============================================
+// AGENT EXECUTION TRACKING
+// ============================================
+
+model AgentExecution {
+  id        String  @id @default(cuid())
+  inquiryId String
+  inquiry   Inquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
+
+  agentType AgentType
+  status    AgentExecutionStatus @default(PENDING)
+
+  // Job tracking
+  jobId String?
+
+  // Execution details
+  startedAt   DateTime?
+  completedAt DateTime?
+  durationMs  Int?
+
+  // Results
+  input        Json?
+  output       Json?
+  errorMessage String? @db.Text
+  errorStack   String? @db.Text
+
+  // Retry tracking
+  attemptNumber Int @default(1)
+  maxAttempts   Int @default(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([inquiryId, agentType])
+  @@index([status])
+  @@index([jobId])
+}
+
+// ============================================
+// AUDIT LOGGING
+// ============================================
+
+model AuditLog {
+  id     String  @id @default(cuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  action     String
+  entityType String
+  entityId   String?
+
+  oldValues Json?
+  newValues Json?
+  metadata  Json?
+
+  ipAddress String?
+  userAgent String?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// ============================================
+// SYSTEM CONFIGURATION
+// ============================================
+
+model SystemConfig {
+  id    String @id @default(cuid())
+  key   String @unique
+  value Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

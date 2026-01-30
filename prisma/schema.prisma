@@ -283,8 +283,21 @@ model SearchResult {
   id        String  @id @default(cuid())
   inquiryId String
   inquiry   Inquiry @relation(fields: [inquiryId], references: [id], onDelete: Cascade)
-  resortId  String
-  resort    Resort  @relation(fields: [resortId], references: [id])
+  resortId  String?  // Optional - null for web search results
+  resort    Resort?  @relation(fields: [resortId], references: [id])
+
+  // Source of result
+  source    String   @default("database") // "database" or "web"
+
+  // Web search metadata (for web results only)
+  webResortName String?  @db.VarChar(255)
+  webResortUrl  String?  @db.VarChar(512)
+  webDescription String? @db.Text
+  webAmenities   String[] // Amenities from web scraping
+  webHighlights  String[] // AI-identified highlights
+  webConsiderations String[] // AI-identified considerations
+  webContactPhone String?
+  webContactEmail String?
 
   // Match scoring
   matchScore        Decimal @db.Decimal(5, 2)
@@ -318,9 +331,9 @@ model SearchResult {
 
   createdAt DateTime @default(now())
 
-  @@unique([inquiryId, resortId])
   @@index([inquiryId])
   @@index([matchScore])
+  @@index([source])
 }
 
 model BookingRequest {

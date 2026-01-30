@@ -64,6 +64,12 @@ export async function processBookingAgent(
     for (const searchResult of inquiry.searchResults) {
       const resort = searchResult.resort;
 
+      // Skip web search results (no associated resort in database)
+      if (!resort) {
+        console.log(`[Booking Agent] Skipping search result ${searchResult.id} - no database resort`);
+        continue;
+      }
+
       // Compile booking data
       const bookingData = {
         inquiryNumber: inquiry.inquiryNumber,

@@ -1,16 +1,22 @@
 import { Job } from "bullmq";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db";
+import { decryptPII } from "../encryption";
+import { searchForGolfResorts, cleanup as cleanupBrowser } from "../services/web-search";
+import { analyzeResortResults, generateItinerary, estimatePricing } from "../services/gemini";
+import { getWeatherForLocation } from "../services/weather";
+import { DESTINATIONS } from "../validation";
 import type { AgentJobData, AgentResult } from "@/types";
 import { Decimal } from "@prisma/client/runtime/library";
 
-interface ResortMatch {
+interface DatabaseResortMatch {
   resortId: string;
+  resortName: string;
   matchScore: number;
+  source: "database";
   availabilityMatch: boolean;
   capacityMatch: boolean;
   priceMatch: boolean | null;
-  // Price ranges per Original Prompt requirements
   estimatedTotal: number | null;
   estimatedMin: number | null;
   estimatedMax: number | null;
@@ -23,7 +29,37 @@ interface ResortMatch {
   weatherOverview: { avgHigh: number; avgLow: number; conditions: string } | null;
   sampleItinerary: Array<{ day: number; activities: string[] }> | null;
   notes: string[];
+  contactInfo?: {
+    phone?: string;
+    email?: string;
+    website?: string;
+  };
 }
+
+interface WebResortMatch {
+  resortId: string; // Generated ID for web results
+  resortName: string;
+  matchScore: number;
+  source: "web";
+  description: string;
+  estimatedMin: number | null;
+  estimatedMax: number | null;
+  perPersonMin: number | null;
+  perPersonMax: number | null;
+  pricingAssumptions: string[];
+  weatherOverview: { avgHigh: number; avgLow: number; conditions: string } | null;
+  sampleItinerary: Array<{ day: number; activities: string[] }> | null;
+  amenities: string[];
+  highlights: string[];
+  considerations: string[];
+  contactInfo: {
+    phone?: string;
+    email?: string;
+    website?: string;
+  };
+}
+
+type ResortMatch = DatabaseResortMatch | WebResortMatch;
 
 export async function processSearchAgent(
   job: Job<AgentJobData>
@@ -53,7 +89,20 @@ export async function processSearchAgent(
       throw new Error(`Inquiry not found: ${inquiryId}`);
     }
 
-    // Fetch all active resorts
+    // Get destination info
+    const destinationInfo = DESTINATIONS.find((d) => d.value === inquiry.destination);
+    const destinationLabel = destinationInfo
+      ? `${destinationInfo.label}, ${destinationInfo.state}`
+      : inquiry.destination;
+
+    console.log(`[Search Agent] Processing inquiry ${inquiry.inquiryNumber}`);
+    console.log(`[Search Agent] Destination: ${destinationLabel}`);
+
+    // ========================================
+    // PHASE 1: Search Internal Database
+    // ========================================
+    console.log("[Search Agent] Phase 1: Searching internal database...");
+
     const resorts = await prisma.resort.findMany({
       where: { isActive: true },
       include: {
@@ -66,63 +115,208 @@ export async function processSearchAgent(
       },
     });
 
-    const matches: ResortMatch[] = [];
+    const dbMatches: DatabaseResortMatch[] = [];
 
     for (const resort of resorts) {
-      const match = evaluateResortMatch(inquiry, resort);
+      const match = await evaluateDatabaseResort(inquiry, resort, destinationLabel);
       if (match.matchScore > 0) {
-        matches.push(match);
+        dbMatches.push(match);
       }
     }
 
-    // Sort by match score descending
-    matches.sort((a, b) => b.matchScore - a.matchScore);
+    // Sort database matches by score
+    dbMatches.sort((a, b) => b.matchScore - a.matchScore);
+    console.log(`[Search Agent] Found ${dbMatches.length} database matches`);
+
+    // ========================================
+    // PHASE 2: Search the Web
+    // ========================================
+    console.log("[Search Agent] Phase 2: Searching the web...");
+
+    let webMatches: WebResortMatch[] = [];
+
+    try {
+      // Search the web for golf resorts
+      const webResults = await searchForGolfResorts(destinationLabel);
+      console.log(`[Search Agent] Found ${webResults.length} web results`);
+
+      if (webResults.length > 0) {
+        // Use Gemini to analyze web results
+        console.log("[Search Agent] Analyzing web results with Gemini AI...");
+
+        const analyzedResults = await analyzeResortResults(webResults, {
+          destination: destinationLabel,
+          numberOfGolfers: inquiry.numberOfGolfers,
+          numberOfNights: inquiry.numberOfNights,
+          roundsPerGolfer: inquiry.roundsPerGolfer,
+          numberOfRooms: inquiry.numberOfRooms,
+          budgetMin: inquiry.budgetMin ? Number(inquiry.budgetMin) : undefined,
+          budgetMax: inquiry.budgetMax ? Number(inquiry.budgetMax) : undefined,
+          specialRequests: inquiry.specialRequests || undefined,
+        });
+
+        // Get weather for the destination
+        console.log("[Search Agent] Fetching weather data...");
+        const weather = await getWeatherForLocation(destinationLabel, inquiry.arrivalDate);
+
+        // Convert analyzed results to WebResortMatch format
+        for (const result of analyzedResults) {
+          // Generate itinerary for top results
+          const itinerary = await generateItinerary(
+            result.name,
+            inquiry.numberOfNights,
+            inquiry.roundsPerGolfer,
+            inquiry.numberOfGolfers,
+            destinationLabel
+          );
+
+          // Estimate pricing
+          const pricing = await estimatePricing(
+            result.name,
+            destinationLabel,
+            inquiry.numberOfGolfers,
+            inquiry.numberOfNights,
+            inquiry.roundsPerGolfer,
+            inquiry.numberOfRooms
+          );
+
+          webMatches.push({
+            resortId: `web-${Buffer.from(result.name).toString("base64").slice(0, 16)}`,
+            resortName: result.name,
+            matchScore: result.overallScore,
+            source: "web",
+            description: result.description,
+            estimatedMin: pricing?.estimatedMin || null,
+            estimatedMax: pricing?.estimatedMax || null,
+            perPersonMin: pricing?.perPersonMin || null,
+            perPersonMax: pricing?.perPersonMax || null,
+            pricingAssumptions: pricing?.assumptions || [],
+            weatherOverview: weather
+              ? {
+                  avgHigh: weather.avgHigh,
+                  avgLow: weather.avgLow,
+                  conditions: weather.conditions,
+                }
+              : null,
+            sampleItinerary: itinerary,
+            amenities: result.amenities,
+            highlights: result.highlights,
+            considerations: result.considerations,
+            contactInfo: result.contactInfo,
+          });
+        }
+
+        // Sort web matches by score
+        webMatches.sort((a, b) => b.matchScore - a.matchScore);
+        console.log(`[Search Agent] Processed ${webMatches.length} web matches`);
+      }
+    } catch (webError) {
+      console.error("[Search Agent] Web search error:", webError);
+      // Continue with database results only
+    } finally {
+      // Cleanup browser resources
+      await cleanupBrowser();
+    }
+
+    // ========================================
+    // PHASE 3: Collate Results
+    // ========================================
+    console.log("[Search Agent] Phase 3: Collating results...");
 
     // Clear existing search results for this inquiry
     await prisma.searchResult.deleteMany({
       where: { inquiryId },
     });
 
-    // Create new search results
-    if (matches.length > 0) {
-      await prisma.searchResult.createMany({
-        data: matches.map((match) => ({
-          inquiryId,
-          resortId: match.resortId,
-          matchScore: new Decimal(match.matchScore),
-          availabilityMatch: match.availabilityMatch,
-          capacityMatch: match.capacityMatch,
-          priceMatch: match.priceMatch,
-          estimatedTotal: match.estimatedTotal
-            ? new Decimal(match.estimatedTotal)
-            : null,
-          estimatedMin: match.estimatedMin
-            ? new Decimal(match.estimatedMin)
-            : null,
-          estimatedMax: match.estimatedMax
-            ? new Decimal(match.estimatedMax)
-            : null,
-          perPersonMin: match.perPersonMin
-            ? new Decimal(match.perPersonMin)
-            : null,
-          perPersonMax: match.perPersonMax
-            ? new Decimal(match.perPersonMax)
-            : null,
-          priceBreakdown: match.priceBreakdown
-            ? (match.priceBreakdown as Prisma.InputJsonValue)
-            : Prisma.DbNull,
-          pricingAssumptions: match.pricingAssumptions,
-          availableRooms: match.availableRooms,
-          availableTeeTimes: match.availableTeeTimes,
-          weatherOverview: match.weatherOverview
-            ? (match.weatherOverview as Prisma.InputJsonValue)
-            : Prisma.DbNull,
-          sampleItinerary: match.sampleItinerary
-            ? (match.sampleItinerary as Prisma.InputJsonValue)
-            : Prisma.DbNull,
-          notes: match.notes.join("\n"),
-        })),
-      });
+    // Store database matches first
+    const allMatches: ResortMatch[] = [...dbMatches, ...webMatches];
+
+    if (allMatches.length > 0) {
+      // Create search results - database results first
+      for (const match of dbMatches) {
+        await prisma.searchResult.create({
+          data: {
+            inquiryId,
+            resortId: match.resortId,
+            source: "database",
+            matchScore: new Decimal(match.matchScore),
+            availabilityMatch: match.availabilityMatch,
+            capacityMatch: match.capacityMatch,
+            priceMatch: match.priceMatch,
+            estimatedTotal: match.estimatedTotal
+              ? new Decimal(match.estimatedTotal)
+              : null,
+            estimatedMin: match.estimatedMin
+              ? new Decimal(match.estimatedMin)
+              : null,
+            estimatedMax: match.estimatedMax
+              ? new Decimal(match.estimatedMax)
+              : null,
+            perPersonMin: match.perPersonMin
+              ? new Decimal(match.perPersonMin)
+              : null,
+            perPersonMax: match.perPersonMax
+              ? new Decimal(match.perPersonMax)
+              : null,
+            priceBreakdown: match.priceBreakdown
+              ? (match.priceBreakdown as Prisma.InputJsonValue)
+              : Prisma.DbNull,
+            pricingAssumptions: match.pricingAssumptions,
+            availableRooms: match.availableRooms,
+            availableTeeTimes: match.availableTeeTimes,
+            weatherOverview: match.weatherOverview
+              ? (match.weatherOverview as Prisma.InputJsonValue)
+              : Prisma.DbNull,
+            sampleItinerary: match.sampleItinerary
+              ? (match.sampleItinerary as Prisma.InputJsonValue)
+              : Prisma.DbNull,
+            notes: match.notes.join("\n"),
+          },
+        });
+      }
+
+      // Store web results with proper fields
+      for (const match of webMatches) {
+        await prisma.searchResult.create({
+          data: {
+            inquiryId,
+            resortId: null, // No database resort
+            source: "web",
+            webResortName: match.resortName,
+            webResortUrl: match.contactInfo.website,
+            webDescription: match.description,
+            webAmenities: match.amenities,
+            webHighlights: match.highlights,
+            webConsiderations: match.considerations,
+            webContactPhone: match.contactInfo.phone,
+            webContactEmail: match.contactInfo.email,
+            matchScore: new Decimal(match.matchScore),
+            availabilityMatch: true, // Assumed from web
+            capacityMatch: true, // Verified by Gemini
+            priceMatch: null,
+            estimatedMin: match.estimatedMin
+              ? new Decimal(match.estimatedMin)
+              : null,
+            estimatedMax: match.estimatedMax
+              ? new Decimal(match.estimatedMax)
+              : null,
+            perPersonMin: match.perPersonMin
+              ? new Decimal(match.perPersonMin)
+              : null,
+            perPersonMax: match.perPersonMax
+              ? new Decimal(match.perPersonMax)
+              : null,
+            pricingAssumptions: match.pricingAssumptions,
+            weatherOverview: match.weatherOverview
+              ? (match.weatherOverview as Prisma.InputJsonValue)
+              : Prisma.DbNull,
+            sampleItinerary: match.sampleItinerary
+              ? (match.sampleItinerary as Prisma.InputJsonValue)
+              : Prisma.DbNull,
+            notes: null,
+          },
+        });
+      }
     }
 
     // Update inquiry status
@@ -140,10 +334,18 @@ export async function processSearchAgent(
         completedAt: new Date(),
         durationMs,
         output: {
-          matchCount: matches.length,
-          topMatches: matches.slice(0, 5).map((m) => ({
-            ...m,
-            priceBreakdown: m.priceBreakdown ?? undefined,
+          databaseMatchCount: dbMatches.length,
+          webMatchCount: webMatches.length,
+          totalMatchCount: allMatches.length,
+          topDatabaseMatches: dbMatches.slice(0, 3).map((m) => ({
+            name: m.resortName,
+            score: m.matchScore,
+            source: m.source,
+          })),
+          topWebMatches: webMatches.slice(0, 3).map((m) => ({
+            name: m.resortName,
+            score: m.matchScore,
+            source: m.source,
           })),
         } as Prisma.InputJsonValue,
       },
@@ -156,23 +358,31 @@ export async function processSearchAgent(
         entityType: "Inquiry",
         entityId: inquiryId,
         metadata: {
-          resortCount: resorts.length,
-          matchCount: matches.length,
+          databaseResortCount: resorts.length,
+          databaseMatchCount: dbMatches.length,
+          webMatchCount: webMatches.length,
+          totalMatchCount: allMatches.length,
           durationMs,
         },
       },
     });
 
+    console.log(`[Search Agent] Completed in ${durationMs}ms`);
+    console.log(`[Search Agent] Database matches: ${dbMatches.length}, Web matches: ${webMatches.length}`);
+
     return {
       success: true,
       data: {
-        matchCount: matches.length,
-        topMatches: matches.slice(0, 10),
+        databaseMatchCount: dbMatches.length,
+        webMatchCount: webMatches.length,
+        totalMatchCount: allMatches.length,
       },
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     const durationMs = Date.now() - startTime;
+
+    console.error("[Search Agent] Error:", errorMessage);
 
     await prisma.agentExecution.updateMany({
       where: { jobId: job.id },
@@ -203,104 +413,7 @@ export async function processSearchAgent(
   }
 }
 
-// Monthly weather data for common golf destinations
-const DESTINATION_WEATHER: Record<string, Record<string, { avgHigh: number; avgLow: number; conditions: string }>> = {
-  NC: { // Pinehurst
-    jan: { avgHigh: 52, avgLow: 32, conditions: "Cool and dry" },
-    feb: { avgHigh: 56, avgLow: 34, conditions: "Cool with occasional rain" },
-    mar: { avgHigh: 64, avgLow: 40, conditions: "Mild and pleasant" },
-    apr: { avgHigh: 73, avgLow: 48, conditions: "Warm and ideal for golf" },
-    may: { avgHigh: 80, avgLow: 57, conditions: "Warm with low humidity" },
-    jun: { avgHigh: 87, avgLow: 65, conditions: "Hot with afternoon storms possible" },
-    jul: { avgHigh: 90, avgLow: 69, conditions: "Hot and humid" },
-    aug: { avgHigh: 88, avgLow: 68, conditions: "Hot and humid" },
-    sep: { avgHigh: 82, avgLow: 62, conditions: "Warm and pleasant" },
-    oct: { avgHigh: 72, avgLow: 50, conditions: "Perfect golf weather" },
-    nov: { avgHigh: 62, avgLow: 40, conditions: "Cool and crisp" },
-    dec: { avgHigh: 53, avgLow: 33, conditions: "Cool with occasional frost" },
-  },
-  WI: { // Kohler
-    jan: { avgHigh: 28, avgLow: 13, conditions: "Cold with snow" },
-    feb: { avgHigh: 32, avgLow: 16, conditions: "Cold with snow" },
-    mar: { avgHigh: 43, avgLow: 26, conditions: "Cool, thawing" },
-    apr: { avgHigh: 55, avgLow: 36, conditions: "Cool and variable" },
-    may: { avgHigh: 66, avgLow: 46, conditions: "Pleasant with spring showers" },
-    jun: { avgHigh: 76, avgLow: 56, conditions: "Warm and ideal" },
-    jul: { avgHigh: 81, avgLow: 62, conditions: "Warm and sunny" },
-    aug: { avgHigh: 79, avgLow: 61, conditions: "Warm and pleasant" },
-    sep: { avgHigh: 71, avgLow: 52, conditions: "Comfortable and clear" },
-    oct: { avgHigh: 58, avgLow: 41, conditions: "Cool and colorful" },
-    nov: { avgHigh: 44, avgLow: 30, conditions: "Cold, season ending" },
-    dec: { avgHigh: 31, avgLow: 17, conditions: "Cold with snow" },
-  },
-  MO: { // Big Cedar
-    jan: { avgHigh: 45, avgLow: 25, conditions: "Cool and dry" },
-    feb: { avgHigh: 51, avgLow: 29, conditions: "Cool with occasional rain" },
-    mar: { avgHigh: 60, avgLow: 37, conditions: "Mild and pleasant" },
-    apr: { avgHigh: 70, avgLow: 46, conditions: "Warm with spring showers" },
-    may: { avgHigh: 77, avgLow: 55, conditions: "Warm and pleasant" },
-    jun: { avgHigh: 85, avgLow: 64, conditions: "Hot with afternoon storms" },
-    jul: { avgHigh: 90, avgLow: 68, conditions: "Hot and humid" },
-    aug: { avgHigh: 89, avgLow: 67, conditions: "Hot and humid" },
-    sep: { avgHigh: 81, avgLow: 58, conditions: "Warm and pleasant" },
-    oct: { avgHigh: 70, avgLow: 47, conditions: "Perfect fall golf" },
-    nov: { avgHigh: 57, avgLow: 36, conditions: "Cool and crisp" },
-    dec: { avgHigh: 46, avgLow: 27, conditions: "Cool with occasional frost" },
-  },
-};
-
-function getWeatherForMonth(state: string, arrivalDate: Date): { avgHigh: number; avgLow: number; conditions: string } | null {
-  const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-  const month = months[arrivalDate.getMonth()];
-  const stateWeather = DESTINATION_WEATHER[state];
-  return stateWeather?.[month] || null;
-}
-
-function generateSampleItinerary(
-  numberOfNights: number,
-  roundsPerGolfer: number,
-  resortName: string
-): Array<{ day: number; activities: string[] }> {
-  const itinerary: Array<{ day: number; activities: string[] }> = [];
-  let roundsScheduled = 0;
-
-  for (let day = 1; day <= numberOfNights + 1; day++) {
-    const activities: string[] = [];
-
-    if (day === 1) {
-      activities.push("Arrival and check-in");
-      activities.push("Range session and course orientation");
-      if (roundsScheduled < roundsPerGolfer) {
-        activities.push(`Afternoon round at ${resortName}`);
-        roundsScheduled++;
-      }
-      activities.push("Welcome dinner");
-    } else if (day === numberOfNights + 1) {
-      activities.push("Breakfast");
-      activities.push("Check-out and departure");
-    } else {
-      activities.push("Breakfast at resort");
-      if (roundsScheduled < roundsPerGolfer) {
-        activities.push(`Morning round (18 holes)`);
-        roundsScheduled++;
-      }
-      if (roundsScheduled < roundsPerGolfer && day < numberOfNights) {
-        activities.push("Lunch at clubhouse");
-        activities.push(`Afternoon round (18 holes)`);
-        roundsScheduled++;
-      } else {
-        activities.push("Leisure time / spa / practice");
-      }
-      activities.push("Group dinner");
-    }
-
-    itinerary.push({ day, activities });
-  }
-
-  return itinerary;
-}
-
-function evaluateResortMatch(
+async function evaluateDatabaseResort(
   inquiry: {
     arrivalDate: Date;
     departureDate: Date;
@@ -312,6 +425,7 @@ function evaluateResortMatch(
     budgetMin: Decimal | null;
     budgetMax: Decimal | null;
     preferredResorts: string[];
+    destination: string;
   },
   resort: {
     id: string;
@@ -324,7 +438,8 @@ function evaluateResortMatch(
     advanceBookingDays: number;
     basePricePerGolfer: Decimal | null;
     basePricePerRoom: Decimal | null;
-    weatherInfo: unknown;
+    primaryEmail: string;
+    websiteUrl: string | null;
     availabilityWindows: Array<{
       startDate: Date;
       endDate: Date;
@@ -341,8 +456,9 @@ function evaluateResortMatch(
       minimumNights: number | null;
       minimumGolfers: number | null;
     }>;
-  }
-): ResortMatch {
+  },
+  destinationLabel: string
+): Promise<DatabaseResortMatch> {
   const notes: string[] = [];
   let score = 100;
   const pricingAssumptions: string[] = [];
@@ -420,7 +536,7 @@ function evaluateResortMatch(
     notes.push("Includes blackout dates");
   }
 
-  // Calculate estimated price with RANGES per Original Prompt
+  // Calculate estimated price
   let estimatedTotal: number | null = null;
   let estimatedMin: number | null = null;
   let estimatedMax: number | null = null;
@@ -436,44 +552,39 @@ function evaluateResortMatch(
     ? Number(resort.basePricePerRoom)
     : 0;
 
-  // Determine room type assumption
   const roomType = inquiry.roomType || "double";
-  const roomTypeLabel = {
-    single: "Single occupancy",
-    double: "Double occupancy",
-    triple: "Triple occupancy",
-    quad: "Quad occupancy",
-  }[roomType] || "Double occupancy";
+  const roomTypeLabel =
+    {
+      single: "Single occupancy",
+      double: "Double occupancy",
+      triple: "Triple occupancy",
+      quad: "Quad occupancy",
+    }[roomType] || "Double occupancy";
 
   if (basePricePerGolfer > 0 || basePricePerRoom > 0) {
     const golfCost =
-      basePricePerGolfer *
-      inquiry.numberOfGolfers *
-      inquiry.roundsPerGolfer;
+      basePricePerGolfer * inquiry.numberOfGolfers * inquiry.roundsPerGolfer;
     const roomCost =
       basePricePerRoom * inquiry.numberOfRooms * inquiry.numberOfNights;
 
     estimatedTotal = golfCost + roomCost;
 
-    // Generate price ranges (±15% variance per Original Prompt requirement)
-    const varianceLow = 0.85;  // -15%
-    const varianceHigh = 1.15; // +15%
+    const varianceLow = 0.85;
+    const varianceHigh = 1.15;
 
     priceBreakdown = {
       golf: golfCost,
       rooms: roomCost,
-      resortFees: estimatedTotal * 0.05, // Estimated 5% resort fees
+      resortFees: estimatedTotal * 0.05,
       total: estimatedTotal,
     };
 
-    // Add pricing assumptions per Original Prompt
     pricingAssumptions.push(roomTypeLabel);
     pricingAssumptions.push("Standard peak-season rates");
     pricingAssumptions.push("Estimated resort fees included");
     pricingAssumptions.push("Green fees based on standard rates");
     pricingAssumptions.push("Cart fees included");
 
-    // Apply pricing rules
     for (const rule of resort.pricingRules) {
       const ruleApplies =
         (!rule.startDate || inquiry.arrivalDate >= rule.startDate) &&
@@ -486,21 +597,18 @@ function evaluateResortMatch(
         estimatedTotal = estimatedTotal * (1 + adjustment);
         priceBreakdown.adjustment = adjustment * 100;
         priceBreakdown.total = estimatedTotal;
-        break; // Apply first matching rule only
+        break;
       }
     }
 
-    // Calculate final ranges
     estimatedMin = Math.round(estimatedTotal * varianceLow);
     estimatedMax = Math.round(estimatedTotal * varianceHigh);
     perPersonMin = Math.round(estimatedMin / inquiry.numberOfGolfers);
     perPersonMax = Math.round(estimatedMax / inquiry.numberOfGolfers);
 
-    // Check against budget
     if (inquiry.budgetMin || inquiry.budgetMax) {
       const min = inquiry.budgetMin ? Number(inquiry.budgetMin) : 0;
       const max = inquiry.budgetMax ? Number(inquiry.budgetMax) : Infinity;
-      // Use the range midpoint for budget matching
       priceMatch = estimatedTotal >= min && estimatedTotal <= max;
 
       if (!priceMatch) {
@@ -516,22 +624,25 @@ function evaluateResortMatch(
     notes.push("Preferred resort");
   }
 
-  // Ensure score is between 0 and 100
   score = Math.max(0, Math.min(100, score));
 
-  // Get weather for travel dates
-  const weatherOverview = getWeatherForMonth(resort.state, inquiry.arrivalDate);
+  // Get real weather data
+  const weather = await getWeatherForLocation(destinationLabel, inquiry.arrivalDate);
 
-  // Generate sample itinerary
-  const sampleItinerary = generateSampleItinerary(
+  // Generate itinerary
+  const itinerary = await generateItinerary(
+    resort.name,
     inquiry.numberOfNights,
     inquiry.roundsPerGolfer,
-    resort.name
+    inquiry.numberOfGolfers,
+    destinationLabel
   );
 
   return {
     resortId: resort.id,
+    resortName: resort.name,
     matchScore: score,
+    source: "database",
     availabilityMatch,
     capacityMatch,
     priceMatch,
@@ -544,8 +655,18 @@ function evaluateResortMatch(
     pricingAssumptions,
     availableRooms,
     availableTeeTimes,
-    weatherOverview,
-    sampleItinerary,
+    weatherOverview: weather
+      ? {
+          avgHigh: weather.avgHigh,
+          avgLow: weather.avgLow,
+          conditions: weather.conditions,
+        }
+      : null,
+    sampleItinerary: itinerary,
     notes,
+    contactInfo: {
+      email: resort.primaryEmail,
+      website: resort.websiteUrl || undefined,
+    },
   };
 }

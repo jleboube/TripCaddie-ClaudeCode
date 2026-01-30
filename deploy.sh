@@ -78,6 +78,13 @@ ADMIN_PASSWORD=changeme123
 # Email Service (optional - get key at https://resend.com)
 EMAIL_FROM=noreply@tripcaddie.com
 RESEND_API_KEY=
+
+# Search Agent APIs (optional but recommended)
+# OpenWeatherMap for real weather data
+OPENWEATHER_API_KEY=
+
+# Google Gemini for AI-powered resort analysis
+GEMINI_API_KEY=
 EOF
 
     echo -e "${GREEN}✓${NC} Default .env created"

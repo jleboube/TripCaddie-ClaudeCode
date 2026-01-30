@@ -110,15 +110,15 @@ export async function retryAgent(executionId: string) {
     case AgentType.SEARCH:
       return triggerSearchAgent(execution.inquiryId);
     case AgentType.BOOKING:
-      // For booking, we need to get selected resorts
+      // For booking, we need to get selected resorts (excluding web search results)
       const selectedResults = await prisma.searchResult.findMany({
         where: { inquiryId: execution.inquiryId, isSelected: true },
         select: { resortId: true },
       });
-      return triggerBookingAgent(
-        execution.inquiryId,
-        selectedResults.map((r) => r.resortId)
-      );
+      const resortIds = selectedResults
+        .map((r) => r.resortId)
+        .filter((id): id is string => id !== null);
+      return triggerBookingAgent(execution.inquiryId, resortIds);
     default:
       throw new Error("Unknown agent type");
   }

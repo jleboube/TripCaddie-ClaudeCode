@@ -64,12 +64,28 @@ ENV HOSTNAME="0.0.0.0"
 
 ENTRYPOINT ["./scripts/docker-entrypoint.sh"]
 
-# Worker stage - For BullMQ workers
+# Worker stage - For BullMQ workers with Puppeteer support
 FROM node:20-alpine AS worker
-RUN apk add --no-cache libc6-compat openssl
+
+# Install Chromium and dependencies for Puppeteer
+RUN apk add --no-cache \
+    libc6-compat \
+    openssl \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont \
+    font-noto-emoji
+
 WORKDIR /app
 
 ENV NODE_ENV=production
+
+# Puppeteer configuration - use system Chromium
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 # Create non-root user
 RUN addgroup --system --gid 1001 nodejs

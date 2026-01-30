@@ -196,7 +196,7 @@ export default async function InquiryDetailPage({
             <CardHeader>
               <CardTitle>Matched Resorts</CardTitle>
               <CardDescription>
-                Resorts that match this inquiry&apos;s requirements
+                Resorts from database and web search results
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -209,9 +209,10 @@ export default async function InquiryDetailPage({
                   <TableHeader>
                     <TableRow>
                       <TableHead>Resort</TableHead>
+                      <TableHead>Source</TableHead>
                       <TableHead>Location</TableHead>
                       <TableHead>Match Score</TableHead>
-                      <TableHead>Est. Total</TableHead>
+                      <TableHead>Est. Range</TableHead>
                       <TableHead>Selected</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -219,10 +220,36 @@ export default async function InquiryDetailPage({
                     {inquiry.searchResults.map((result) => (
                       <TableRow key={result.id}>
                         <TableCell className="font-medium">
-                          {result.resort.name}
+                          {result.resort ? (
+                            result.resort.name
+                          ) : result.webResortUrl ? (
+                            <a
+                              href={result.webResortUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-600 hover:underline"
+                            >
+                              {result.webResortName || "Unknown Resort"}
+                            </a>
+                          ) : (
+                            result.webResortName || "Unknown Resort"
+                          )}
                         </TableCell>
                         <TableCell>
-                          {result.resort.city}, {result.resort.state}
+                          <Badge
+                            variant={
+                              result.source === "database"
+                                ? "default"
+                                : "outline"
+                            }
+                          >
+                            {result.source === "database" ? "DB" : "Web"}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          {result.resort
+                            ? `${result.resort.city}, ${result.resort.state}`
+                            : "-"}
                         </TableCell>
                         <TableCell>
                           <Badge
@@ -236,9 +263,11 @@ export default async function InquiryDetailPage({
                           </Badge>
                         </TableCell>
                         <TableCell>
-                          {result.estimatedTotal
-                            ? formatCurrency(Number(result.estimatedTotal))
-                            : "-"}
+                          {result.estimatedMin && result.estimatedMax
+                            ? `${formatCurrency(Number(result.estimatedMin))} - ${formatCurrency(Number(result.estimatedMax))}`
+                            : result.estimatedTotal
+                              ? formatCurrency(Number(result.estimatedTotal))
+                              : "-"}
                         </TableCell>
                         <TableCell>
                           {result.isSelected ? (

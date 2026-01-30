@@ -54,10 +54,13 @@ export async function POST(
         result = await triggerSearchAgent(inquiryId);
         break;
       case "BOOKING":
-        const resortIds = inquiry.searchResults.map((r) => r.resortId);
+        // Filter out null resortIds (web search results without database link)
+        const resortIds = inquiry.searchResults
+          .map((r) => r.resortId)
+          .filter((id): id is string => id !== null);
         if (resortIds.length === 0) {
           return NextResponse.json(
-            { error: "No resorts selected for booking" },
+            { error: "No database resorts selected for booking. Web search results cannot be booked directly." },
             { status: 400 }
           );
         }

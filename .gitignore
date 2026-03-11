@@ -62,3 +62,5 @@ Original_Prompt.md
 
 # Claude Code
 .claude/
+# Files blocked by secret scanner - DO NOT REMOVE
+scripts/setup.sh
